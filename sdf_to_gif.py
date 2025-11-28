@@ -343,66 +343,78 @@ def capture_frames(sdf_file, output_gif, frames=60, radius=15.0, height=10.0, cm
         pose = read_camera_pose(cmd)
         
         if pose:
-            start_x, start_y, start_z, _, _, _, _ = pose  # Ignore orientation, we'll recalculate
+            start_x, start_y, start_z, qx, qy, qz, qw = pose
             print(f"  Camera position after focus: ({start_x:.2f}, {start_y:.2f}, {start_z:.2f})")
+            print(f"  Camera orientation: qx={qx:.4f}, qy={qy:.4f}, qz={qz:.4f}, qw={qw:.4f}")
         else:
             # Fallback if we can't read pose
             print("  Warning: Could not read camera pose, using defaults")
             start_x = center_x + radius * 0.5
             start_y = center_y + radius * 0.5
             start_z = radius * 0.5
+            qx, qy, qz, qw = 0.0, 0.38, 0.0, 0.92
         
         # STEP 3: Setup Vector Unzoom
         # ---------------------------------------------------------
         # Target point (Where we are looking at - center of maze at ground level)
         focal_x, focal_y, focal_z = center_x, center_y, 0.0
         
-        # Vector from Target TO Camera (The "Backwards" vector)
-        vec_x = start_x - focal_x
-        vec_y = start_y - focal_y
-        vec_z = start_z - focal_z
+        # Extract the forward direction from camera's quaternion orientation
+        # The camera looks along +X axis in body frame, so we transform [1,0,0] by quaternion
+        # Formula: v' = q * v * q^-1, but for unit vector along X:
+        # forward_x = 1 - 2*(qy^2 + qz^2)
+        # forward_y = 2*(qx*qy + qz*qw)
+        # forward_z = 2*(qx*qz - qy*qw)
+        fwd_x = 1.0 - 2.0*(qy*qy + qz*qz)
+        fwd_y = 2.0*(qx*qy + qz*qw)
+        fwd_z = 2.0*(qx*qz - qy*qw)
         
-        # Calculate current distance (magnitude)
-        current_dist = math.sqrt(vec_x**2 + vec_y**2 + vec_z**2)
+        # The unzoom direction is OPPOSITE to forward (moving backwards)
+        dir_x = -fwd_x
+        dir_y = -fwd_y
+        dir_z = -fwd_z
         
-        # Normalize the vector (Direction unit vector)
-        if current_dist > 0:
-            dir_x = vec_x / current_dist
-            dir_y = vec_y / current_dist
-            dir_z = vec_z / current_dist
-        else:
-            # Fallback if camera is exactly at the target (unlikely)
-            dir_x, dir_y, dir_z = 1.0, 0.0, 1.0
-            current_dist = radius
+        # Normalize (should already be unit length, but ensure)
+        dir_len = math.sqrt(dir_x**2 + dir_y**2 + dir_z**2)
+        if dir_len > 0:
+            dir_x /= dir_len
+            dir_y /= dir_len
+            dir_z /= dir_len
+        
+        # Calculate starting distance from focal point
+        vec_to_cam_x = start_x - focal_x
+        vec_to_cam_y = start_y - focal_y
+        vec_to_cam_z = start_z - focal_z
+        start_distance = math.sqrt(vec_to_cam_x**2 + vec_to_cam_y**2 + vec_to_cam_z**2)
         
         # Define Zoom limits
-        start_distance = current_dist
-        end_distance = current_dist * 3.5  # Zoom out to 3.5x distance
+        end_distance = start_distance * 3.5  # Zoom out to 3.5x distance
         
         print(f"STEP 3: Vector Unzoom Setup")
         print(f"  Target (focal point): ({focal_x:.1f}, {focal_y:.1f}, {focal_z:.1f})")
-        print(f"  Direction vector: <{dir_x:.3f}, {dir_y:.3f}, {dir_z:.3f}>")
+        print(f"  Camera forward dir: <{fwd_x:.3f}, {fwd_y:.3f}, {fwd_z:.3f}>")
+        print(f"  Unzoom direction: <{dir_x:.3f}, {dir_y:.3f}, {dir_z:.3f}>")
         print(f"  Distance: {start_distance:.1f}m → {end_distance:.1f}m")
         
         # STEP 4: Animation Loop - Capture frames while unzooming
-        print(f"STEP 4: Capturing {frames} frames...")
+        # Use FIXED orientation (same as after focus) for consistent view
+        print(f"STEP 4: Capturing {frames} frames (fixed orientation from focus)...")
         for i in range(frames):
             # Linear Interpolation of the Distance
             t = i / max(frames - 1, 1)
             new_dist = start_distance + (end_distance - start_distance) * t
             
-            # Calculate New Camera Position: Pos = Target + (Direction * NewDistance)
-            cam_x = focal_x + (dir_x * new_dist)
-            cam_y = focal_y + (dir_y * new_dist)
-            cam_z = focal_z + (dir_z * new_dist)
-            
-            # Recalculate Orientation to keep target perfectly centered (LookAt)
-            q = calculate_lookat_quaternion(cam_x, cam_y, cam_z, focal_x, focal_y, focal_z)
+            # Calculate New Camera Position by moving along unzoom direction from start
+            # Start from initial position and move backwards
+            move_amount = new_dist - start_distance
+            cam_x = start_x + (dir_x * move_amount)
+            cam_y = start_y + (dir_y * move_amount)
+            cam_z = start_z + (dir_z * move_amount)
             
             print(f"  Frame {i+1}/{frames}: dist={new_dist:.1f}m → pos=({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})")
             
-            # Move Camera with calculated LookAt orientation
-            move_camera_quat(cam_x, cam_y, cam_z, q['x'], q['y'], q['z'], q['w'], cmd)
+            # Move Camera with FIXED orientation (same as after focus)
+            move_camera_quat(cam_x, cam_y, cam_z, qx, qy, qz, qw, cmd)
             
             # Wait for camera to settle
             time.sleep(0.4)
