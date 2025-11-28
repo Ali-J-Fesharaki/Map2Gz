@@ -1,0 +1,9 @@
+free_thresh: 0.196
+image: maze_batch_0.pgm
+negate: 0
+occupied_thresh: 0.65
+origin:
+- 0.0
+- 0.0
+- 0.0
+resolution: 0.03480278422273782

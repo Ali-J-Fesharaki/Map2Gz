@@ -1,0 +1,8 @@
+numpy
+PyYAML
+Pillow
+opencv-python
+requests
+cairosvg
+scipy
+scikit-image
