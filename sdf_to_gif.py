@@ -287,8 +287,188 @@ def wait_for_service(service_name, timeout=30, cmd='ign'):
     print(f"Timeout waiting for {service_name}. Is the GUI loaded?")
     return False
 
+
+# =============================================================================
+# MODULAR ANIMATION FUNCTIONS
+# =============================================================================
+
+def capture_single_frame(frame_index, frames_dir, cmd='ign'):
+    """Capture a single screenshot and save it to frames_dir.
+    
+    Returns:
+        str: Path to saved frame, or None if failed
+    """
+    frame_path = os.path.join(frames_dir, f"frame_{frame_index:03d}.png")
+    
+    # Get file count in default directories before screenshot
+    search_dirs = get_default_screenshot_dir(cmd)
+    files_before = {}
+    for d in search_dirs:
+        if os.path.exists(d):
+            try:
+                files_before[d] = set(os.listdir(d))
+            except:
+                files_before[d] = set()
+    
+    # Take screenshot
+    success = take_screenshot(cmd)
+    
+    if not success:
+        return None
+    
+    # Wait and look for new file in default directories
+    timeout = 5.0
+    start_wait = time.time()
+    
+    while (time.time() - start_wait) < timeout:
+        for d in search_dirs:
+            if not os.path.exists(d):
+                continue
+            try:
+                files_now = set(os.listdir(d))
+                new_files = files_now - files_before.get(d, set())
+                
+                for nf in new_files:
+                    if nf.endswith('.png'):
+                        fp = os.path.join(d, nf)
+                        shutil.move(fp, frame_path)
+                        return frame_path
+            except:
+                pass
+        time.sleep(0.2)
+    
+    return None
+
+
+def animate_unzoom(start_x, start_y, start_z, qx, qy, qz, qw,
+                   focal_x, focal_y, focal_z,
+                   start_distance, end_distance,
+                   num_frames, frames_dir, cmd='ign', settle_time=0.3):
+    """
+    Perform unzoom animation: move camera backwards along its view direction.
+    
+    Args:
+        start_x/y/z: Initial camera position
+        qx/qy/qz/qw: Camera orientation quaternion (fixed during unzoom)
+        focal_x/y/z: Target point camera is looking at
+        start_distance: Starting distance from focal point
+        end_distance: Ending distance from focal point
+        num_frames: Number of frames to capture
+        frames_dir: Directory to save frames
+        cmd: Gazebo command ('ign' or 'gz')
+        settle_time: Time to wait after moving camera
+    
+    Returns:
+        tuple: (list of captured frame paths, final camera position (x, y, z))
+    """
+    captured = []
+    
+    # Extract forward direction from quaternion
+    # Camera looks along +X axis in body frame
+    fwd_x = 1.0 - 2.0*(qy*qy + qz*qz)
+    fwd_y = 2.0*(qx*qy + qz*qw)
+    fwd_z = 2.0*(qx*qz - qy*qw)
+    
+    # Unzoom direction is opposite to forward
+    dir_x, dir_y, dir_z = -fwd_x, -fwd_y, -fwd_z
+    
+    # Normalize
+    dir_len = math.sqrt(dir_x**2 + dir_y**2 + dir_z**2)
+    if dir_len > 0:
+        dir_x /= dir_len
+        dir_y /= dir_len
+        dir_z /= dir_len
+    
+    print(f"  Unzoom: {num_frames} frames, distance {start_distance:.1f}m → {end_distance:.1f}m")
+    
+    cam_x, cam_y, cam_z = start_x, start_y, start_z
+    
+    for i in range(num_frames):
+        # Linear interpolation of distance
+        t = i / max(num_frames - 1, 1)
+        new_dist = start_distance + (end_distance - start_distance) * t
+        
+        # Calculate camera position
+        move_amount = new_dist - start_distance
+        cam_x = start_x + (dir_x * move_amount)
+        cam_y = start_y + (dir_y * move_amount)
+        cam_z = start_z + (dir_z * move_amount)
+        
+        # Move camera with fixed orientation
+        move_camera_quat(cam_x, cam_y, cam_z, qx, qy, qz, qw, cmd)
+        time.sleep(settle_time)
+        
+        # Capture frame
+        frame_idx = len(captured)
+        frame_path = capture_single_frame(frame_idx, frames_dir, cmd)
+        if frame_path:
+            captured.append(frame_path)
+            print(f"    Frame {i+1}/{num_frames}: dist={new_dist:.1f}m", end='\r')
+    
+    print()
+    return captured, (cam_x, cam_y, cam_z)
+
+
+def animate_orbit(focal_x, focal_y, focal_z,
+                  orbit_radius, orbit_height,
+                  start_angle, num_frames, frames_dir,
+                  frame_offset=0, cmd='ign', settle_time=0.3):
+    """
+    Perform orbit animation: circle around focal point while looking at it.
+    
+    Args:
+        focal_x/y/z: Center point to orbit around and look at
+        orbit_radius: Radius of the circular orbit (in XY plane)
+        orbit_height: Z height of camera during orbit
+        start_angle: Starting angle in radians
+        num_frames: Number of frames for one full rotation
+        frames_dir: Directory to save frames
+        frame_offset: Starting frame number (for continuing from previous animation)
+        cmd: Gazebo command
+        settle_time: Time to wait after moving camera
+    
+    Returns:
+        list: Paths to captured frames
+    """
+    captured = []
+    
+    print(f"  Orbit: {num_frames} frames, radius={orbit_radius:.1f}m, height={orbit_height:.1f}m")
+    
+    for i in range(num_frames):
+        # Calculate angle (one full circle = 2*pi)
+        progress = i / num_frames
+        theta = start_angle + (2 * math.pi * progress)
+        
+        # Calculate position on circle
+        cam_x = focal_x + orbit_radius * math.cos(theta)
+        cam_y = focal_y + orbit_radius * math.sin(theta)
+        cam_z = orbit_height
+        
+        # Calculate orientation to look at focal point
+        q = calculate_lookat_quaternion(cam_x, cam_y, cam_z, focal_x, focal_y, focal_z)
+        
+        # Move camera
+        move_camera_quat(cam_x, cam_y, cam_z, q['x'], q['y'], q['z'], q['w'], cmd)
+        time.sleep(settle_time)
+        
+        # Capture frame
+        frame_idx = frame_offset + len(captured)
+        frame_path = capture_single_frame(frame_idx, frames_dir, cmd)
+        if frame_path:
+            captured.append(frame_path)
+            angle_deg = math.degrees(theta) % 360
+            print(f"    Frame {i+1}/{num_frames}: angle={angle_deg:.0f}°", end='\r')
+    
+    print()
+    return captured
+
+
+# =============================================================================
+# MAIN CAPTURE FUNCTION
+# =============================================================================
+
 def capture_frames(sdf_file, output_gif, frames=60, radius=15.0, height=10.0, cmd='ign'):
-    """Launch Gazebo, orbit camera, capture frames, create GIF"""
+    """Launch Gazebo, perform unzoom + orbit animation, capture frames, create GIF"""
     
     print(f"\n{'='*60}")
     print(f"Processing {sdf_file}...")
@@ -327,185 +507,114 @@ def capture_frames(sdf_file, output_gif, frames=60, radius=15.0, height=10.0, cm
         os.makedirs(frames_dir)
         
         print(f"Capturing frames to {frames_dir}...")
-        captured_images = []
         
         # Wait for scene to fully render
         print("Waiting for scene to render...")
         time.sleep(4)
         
-        # STEP 1: Focus on ground_plane model to center the camera (ground mode)
-        print("STEP 1: Focusing on ground_plane (centering camera)...")
+        # =====================================================================
+        # PHASE 1: Focus on ground_plane to center camera
+        # =====================================================================
+        print("\nPHASE 1: Focusing on ground_plane (centering camera)...")
         focus_on_model("ground_plane", cmd)
-        time.sleep(2.0)  # Wait for focus animation to complete
+        time.sleep(2.0)
         
-        # STEP 2: Read the camera pose after focus (this is our starting position)
-        print("STEP 2: Reading camera pose after focus...")
+        # Read camera pose after focus
         pose = read_camera_pose(cmd)
         
         if pose:
             start_x, start_y, start_z, qx, qy, qz, qw = pose
-            print(f"  Camera position after focus: ({start_x:.2f}, {start_y:.2f}, {start_z:.2f})")
-            print(f"  Camera orientation: qx={qx:.4f}, qy={qy:.4f}, qz={qz:.4f}, qw={qw:.4f}")
+            print(f"  Camera position: ({start_x:.2f}, {start_y:.2f}, {start_z:.2f})")
+            print(f"  Orientation: qx={qx:.4f}, qy={qy:.4f}, qz={qz:.4f}, qw={qw:.4f}")
         else:
-            # Fallback if we can't read pose
             print("  Warning: Could not read camera pose, using defaults")
             start_x = center_x + radius * 0.5
             start_y = center_y + radius * 0.5
             start_z = radius * 0.5
             qx, qy, qz, qw = 0.0, 0.38, 0.0, 0.92
         
-        # STEP 3: Setup Vector Unzoom
-        # ---------------------------------------------------------
-        # Target point (Where we are looking at - center of maze at ground level)
+        # Focal point (center of map at ground level)
         focal_x, focal_y, focal_z = center_x, center_y, 0.0
         
-        # Extract the forward direction from camera's quaternion orientation
-        # The camera looks along +X axis in body frame, so we transform [1,0,0] by quaternion
-        # Formula: v' = q * v * q^-1, but for unit vector along X:
-        # forward_x = 1 - 2*(qy^2 + qz^2)
-        # forward_y = 2*(qx*qy + qz*qw)
-        # forward_z = 2*(qx*qz - qy*qw)
-        fwd_x = 1.0 - 2.0*(qy*qy + qz*qz)
-        fwd_y = 2.0*(qx*qy + qz*qw)
-        fwd_z = 2.0*(qx*qz - qy*qw)
+        # Calculate starting distance
+        dx = start_x - focal_x
+        dy = start_y - focal_y
+        dz = start_z - focal_z
+        start_distance = math.sqrt(dx**2 + dy**2 + dz**2)
         
-        # The unzoom direction is OPPOSITE to forward (moving backwards)
-        dir_x = -fwd_x
-        dir_y = -fwd_y
-        dir_z = -fwd_z
+        # =====================================================================
+        # PHASE 2: Unzoom animation
+        # =====================================================================
+        # Split frames: 1/3 for unzoom, 2/3 for orbit
+        unzoom_frames = max(frames // 3, 6)
+        orbit_frames = frames - unzoom_frames
         
-        # Normalize (should already be unit length, but ensure)
-        dir_len = math.sqrt(dir_x**2 + dir_y**2 + dir_z**2)
-        if dir_len > 0:
-            dir_x /= dir_len
-            dir_y /= dir_len
-            dir_z /= dir_len
+        print(f"\nPHASE 2: Unzoom animation ({unzoom_frames} frames)...")
         
-        # Calculate starting distance from focal point
-        vec_to_cam_x = start_x - focal_x
-        vec_to_cam_y = start_y - focal_y
-        vec_to_cam_z = start_z - focal_z
-        start_distance = math.sqrt(vec_to_cam_x**2 + vec_to_cam_y**2 + vec_to_cam_z**2)
+        end_distance = start_distance * 3.0  # Zoom out to 3x
         
-        # Define Zoom limits
-        end_distance = start_distance * 3.5  # Zoom out to 3.5x distance
+        unzoom_captured, (final_x, final_y, final_z) = animate_unzoom(
+            start_x, start_y, start_z,
+            qx, qy, qz, qw,
+            focal_x, focal_y, focal_z,
+            start_distance, end_distance,
+            unzoom_frames, frames_dir, cmd
+        )
         
-        print(f"STEP 3: Vector Unzoom Setup")
-        print(f"  Target (focal point): ({focal_x:.1f}, {focal_y:.1f}, {focal_z:.1f})")
-        print(f"  Camera forward dir: <{fwd_x:.3f}, {fwd_y:.3f}, {fwd_z:.3f}>")
-        print(f"  Unzoom direction: <{dir_x:.3f}, {dir_y:.3f}, {dir_z:.3f}>")
-        print(f"  Distance: {start_distance:.1f}m → {end_distance:.1f}m")
+        # =====================================================================
+        # PHASE 3: Orbit animation
+        # =====================================================================
+        print(f"\nPHASE 3: Orbit animation ({orbit_frames} frames)...")
         
-        # STEP 4: Animation Loop - Capture frames while unzooming
-        # Use FIXED orientation (same as after focus) for consistent view
-        print(f"STEP 4: Capturing {frames} frames (fixed orientation from focus)...")
-        for i in range(frames):
-            # Linear Interpolation of the Distance
-            t = i / max(frames - 1, 1)
-            new_dist = start_distance + (end_distance - start_distance) * t
-            
-            # Calculate New Camera Position by moving along unzoom direction from start
-            # Start from initial position and move backwards
-            move_amount = new_dist - start_distance
-            cam_x = start_x + (dir_x * move_amount)
-            cam_y = start_y + (dir_y * move_amount)
-            cam_z = start_z + (dir_z * move_amount)
-            
-            print(f"  Frame {i+1}/{frames}: dist={new_dist:.1f}m → pos=({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})")
-            
-            # Move Camera with FIXED orientation (same as after focus)
-            move_camera_quat(cam_x, cam_y, cam_z, qx, qy, qz, qw, cmd)
-            
-            # Wait for camera to settle
-            time.sleep(0.4)
-            
-            # Capture screen using internal service (saves to default location)
-            frame_path = os.path.join(frames_dir, f"frame_{i:03d}.png")
-            
-            # Get file count in default directories before screenshot
-            search_dirs = get_default_screenshot_dir(cmd)
-            files_before = {}
-            for d in search_dirs:
-                if os.path.exists(d):
-                    try:
-                        files_before[d] = set(os.listdir(d))
-                    except:
-                        files_before[d] = set()
-            
-            # Take screenshot
-            call_time = time.time()
-            success = take_screenshot(cmd)
-            
-            if not success:
-                print(f"Warning: Screenshot service call failed for frame {i}")
-                continue
-            
-            # Wait and look for new file in default directories
-            timeout = 5.0
-            start_wait = time.time()
-            found = False
-            latest_file = None
-            
-            while (time.time() - start_wait) < timeout:
-                # Check for new files
-                for d in search_dirs:
-                    if not os.path.exists(d):
-                        continue
-                    try:
-                        files_now = set(os.listdir(d))
-                        new_files = files_now - files_before.get(d, set())
-                        
-                        for nf in new_files:
-                            if nf.endswith('.png'):
-                                fp = os.path.join(d, nf)
-                                latest_file = fp
-                                found = True
-                                break
-                    except:
-                        pass
-                    
-                    if found:
-                        break
-                
-                if found:
-                    break
-                    
-                time.sleep(0.2)
-            
-            if found and latest_file:
-                # Move it to the expected location
-                try:
-                    shutil.move(latest_file, frame_path)
-                    captured_images.append(frame_path)
-                    print(f"Captured frame {i+1}/{frames}", end='\r')
-                except Exception as e:
-                    print(f"Error moving file: {e}")
-                    found = False
-            
-            if not found:
-                print(f"Warning: Frame {i} not found after {timeout}s")
-            
-        print("\nGenerating GIF...")
+        # Calculate orbit parameters from final unzoom position
+        orbit_dx = final_x - focal_x
+        orbit_dy = final_y - focal_y
+        orbit_radius = math.sqrt(orbit_dx**2 + orbit_dy**2)
+        orbit_height = final_z
+        start_angle = math.atan2(orbit_dy, orbit_dx)
         
-        if not captured_images:
+        # Ensure minimum orbit radius
+        if orbit_radius < 5.0:
+            orbit_radius = radius * 2.0
+        
+        print(f"  Orbit radius: {orbit_radius:.1f}m, height: {orbit_height:.1f}m")
+        print(f"  Start angle: {math.degrees(start_angle):.1f}°")
+        
+        orbit_captured = animate_orbit(
+            focal_x, focal_y, focal_z,
+            orbit_radius, orbit_height,
+            start_angle, orbit_frames, frames_dir,
+            frame_offset=len(unzoom_captured), cmd=cmd
+        )
+        
+        # =====================================================================
+        # PHASE 4: Generate GIF
+        # =====================================================================
+        print("\nPHASE 4: Generating GIF...")
+        
+        all_frames = unzoom_captured + orbit_captured
+        
+        if not all_frames:
             print(f"Error: No frames captured for {sdf_file}. Skipping GIF generation.")
             return
+        
+        print(f"  Total frames: {len(all_frames)} ({len(unzoom_captured)} unzoom + {len(orbit_captured)} orbit)")
 
         # Create GIF
-        images = [Image.open(f) for f in captured_images]
+        images = [Image.open(f) for f in all_frames]
         images[0].save(
             output_gif,
             save_all=True,
             append_images=images[1:],
-            duration=100, # ms per frame
+            duration=100,  # ms per frame
             loop=0
         )
         
-        print(f"Saved {output_gif}")
+        print(f"  Saved {output_gif}")
         
     finally:
         # Kill Gazebo and all related processes
-        print("Closing Gazebo...")
+        print("\nClosing Gazebo...")
         gz_process.terminate()
         try:
             gz_process.wait(timeout=3)
