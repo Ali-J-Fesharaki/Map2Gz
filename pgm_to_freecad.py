@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""
+PGM to FreeCAD 3D Model Converter
+---------------------------------
+Converts 2D PGM map files to 3D models using FreeCAD CLI tools.
+
+This module provides functionality to:
+1. Extract wall contours from PGM files
+2. Generate FreeCAD Python scripts for creating 3D geometry
+3. Export to STEP (.stp) or other 3D formats
+4. Create SDF files that reference the generated 3D models
+
+Usage:
+    python pgm_to_freecad.py map.pgm map.yaml --output output_dir
+
+Requirements:
+    - FreeCAD (with FreeCADCmd or freecadcmd CLI)
+    - numpy, opencv-python, PyYAML, Pillow
+"""
+
+import os
+import sys
+import subprocess
+import tempfile
+import shutil
+import argparse
+import numpy as np
+import yaml
+import cv2
+from PIL import Image
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+
+def check_freecad_available():
+    """Check if FreeCAD CLI is available on the system.
+    
+    Returns:
+        str: Path to FreeCAD CLI command if found, None otherwise
+    """
+    # List of possible FreeCAD CLI command names
+    freecad_commands = [
+        'freecadcmd',
+        'FreeCADCmd', 
+        'freecad',
+        'FreeCAD',
+        '/usr/bin/freecadcmd',
+        '/usr/local/bin/freecadcmd',
+        '/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd',
+    ]
+    
+    for cmd in freecad_commands:
+        try:
+            result = subprocess.run([cmd, '--version'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                print(f"Found FreeCAD: {cmd}")
+                return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    
+    return None
+
+
+def load_map_data(pgm_file, yaml_file):
+    """Load PGM image and YAML metadata.
+    
+    Args:
+        pgm_file: Path to PGM image file
+        yaml_file: Path to YAML metadata file
+        
+    Returns:
+        tuple: (numpy array of map, dict of metadata)
+    """
+    with open(yaml_file, 'r') as f:
+        map_metadata = yaml.safe_load(f)
+    
+    image = Image.open(pgm_file).convert('L')
+    map_array = np.array(image)
+    
+    return map_array, map_metadata
+
+
+def extract_wall_contours(map_array, threshold=128, min_area=10):
+    """Extract wall contours from the map array.
+    
+    Args:
+        map_array: Grayscale numpy array of the map
+        threshold: Pixel value threshold for wall detection
+        min_area: Minimum contour area to consider
+        
+    Returns:
+        list: List of contour arrays
+    """
+    # Create binary image: walls = white (255), free space = black (0)
+    binary = (map_array < threshold).astype(np.uint8) * 255
+    
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter by area
+    filtered_contours = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area >= min_area:
+            filtered_contours.append(contour)
+    
+    print(f"Found {len(filtered_contours)} contours (from {len(contours)} total)")
+    return filtered_contours
+
+
+def contours_to_world_coords(contours, resolution, origin, map_height):
+    """Convert contour pixel coordinates to world coordinates.
+    
+    Args:
+        contours: List of contour arrays in pixel coordinates
+        resolution: Meters per pixel
+        origin: [x, y, z] origin in world coordinates
+        map_height: Height of the map in pixels
+        
+    Returns:
+        list: List of contours in world coordinates
+    """
+    world_contours = []
+    
+    for contour in contours:
+        world_points = []
+        for point in contour:
+            px, py = point[0]
+            # Convert to world coordinates (flip Y axis)
+            wx = origin[0] + px * resolution
+            wy = origin[1] + (map_height - py) * resolution
+            world_points.append([wx, wy])
+        world_contours.append(np.array(world_points))
+    
+    return world_contours
+
+
+def generate_freecad_script(world_contours, wall_height, output_step, output_fcstd=None):
+    """Generate a FreeCAD Python script for creating 3D geometry.
+    
+    This script creates a sketch from the contours, then extrudes (pads)
+    them to create 3D walls.
+    
+    Args:
+        world_contours: List of contours in world coordinates (meters)
+        wall_height: Height of walls in meters
+        output_step: Path for STEP file output
+        output_fcstd: Path for FreeCAD document output (optional)
+        
+    Returns:
+        str: FreeCAD Python script content
+    """
+    # Convert contours to string representation for the script
+    contours_data = []
+    for i, contour in enumerate(world_contours):
+        points = contour.tolist()
+        contours_data.append(points)
+    
+    script = f'''#!/usr/bin/env python3
+"""
+FreeCAD script to create 3D walls from 2D contours.
+Generated by pgm_to_freecad.py
+"""
+
+import sys
+import FreeCAD
+import Part
+import Sketcher
+
+# Configuration
+WALL_HEIGHT = {wall_height}
+OUTPUT_STEP = r"{output_step}"
+OUTPUT_FCSTD = r"{output_fcstd if output_fcstd else ''}"
+
+# Contour data (world coordinates in meters, converted to mm for FreeCAD)
+CONTOURS = {contours_data}
+
+def create_wall_from_contour(doc, contour_points, index, wall_height_mm):
+    """Create a 3D wall from a 2D contour."""
+    if len(contour_points) < 3:
+        return None
+    
+    # Create wire from points (convert m to mm)
+    points_mm = []
+    for p in contour_points:
+        points_mm.append(FreeCAD.Vector(p[0] * 1000, p[1] * 1000, 0))
+    
+    # Close the contour
+    if points_mm[0] != points_mm[-1]:
+        points_mm.append(points_mm[0])
+    
+    # Create wire
+    try:
+        edges = []
+        for i in range(len(points_mm) - 1):
+            edge = Part.makeLine(points_mm[i], points_mm[i + 1])
+            edges.append(edge)
+        
+        wire = Part.Wire(edges)
+        face = Part.Face(wire)
+        
+        # Extrude to create 3D wall
+        wall = face.extrude(FreeCAD.Vector(0, 0, wall_height_mm))
+        
+        # Create Part object
+        obj_name = f"Wall_{{index}}"
+        part_obj = doc.addObject("Part::Feature", obj_name)
+        part_obj.Shape = wall
+        
+        return part_obj
+        
+    except Exception as e:
+        print(f"Warning: Could not create wall {{index}}: {{e}}")
+        return None
+
+
+def main():
+    # Create new document
+    doc = FreeCAD.newDocument("Map3D")
+    
+    # Convert wall height to mm
+    wall_height_mm = WALL_HEIGHT * 1000
+    
+    # Create walls from contours
+    walls_created = 0
+    for i, contour in enumerate(CONTOURS):
+        wall = create_wall_from_contour(doc, contour, i, wall_height_mm)
+        if wall:
+            walls_created += 1
+    
+    print(f"Created {{walls_created}} walls from {{len(CONTOURS)}} contours")
+    
+    # Recompute document
+    doc.recompute()
+    
+    # Export to STEP
+    if OUTPUT_STEP:
+        # Get all shapes
+        shapes = []
+        for obj in doc.Objects:
+            if hasattr(obj, 'Shape'):
+                shapes.append(obj.Shape)
+        
+        if shapes:
+            # Create compound of all shapes
+            compound = Part.makeCompound(shapes)
+            compound.exportStep(OUTPUT_STEP)
+            print(f"Exported STEP file: {{OUTPUT_STEP}}")
+    
+    # Save FreeCAD document
+    if OUTPUT_FCSTD:
+        doc.saveAs(OUTPUT_FCSTD)
+        print(f"Saved FreeCAD document: {{OUTPUT_FCSTD}}")
+    
+    return doc
+
+
+if __name__ == "__main__":
+    main()
+    # Exit FreeCAD
+    FreeCAD.closeDocument("Map3D")
+'''
+    
+    return script
+
+
+def run_freecad_script(script_content, freecad_cmd):
+    """Run a FreeCAD Python script using the CLI.
+    
+    Args:
+        script_content: Python script content
+        freecad_cmd: Path to FreeCAD CLI command
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # Write script to temporary file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(script_content)
+        script_path = f.name
+    
+    try:
+        print(f"Running FreeCAD script: {script_path}")
+        result = subprocess.run(
+            [freecad_cmd, script_path],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.stdout:
+            print(f"FreeCAD output: {result.stdout}")
+        if result.stderr:
+            print(f"FreeCAD errors: {result.stderr}")
+        
+        return result.returncode == 0
+        
+    except subprocess.TimeoutExpired:
+        print("Error: FreeCAD script timed out")
+        return False
+    except Exception as e:
+        print(f"Error running FreeCAD: {e}")
+        return False
+    finally:
+        # Clean up temp file
+        if os.path.exists(script_path):
+            os.unlink(script_path)
+
+
+def create_sdf_with_mesh(mesh_file, world_name="slam_world", model_name="map_walls"):
+    """Create an SDF file that references a mesh file (STEP/STL/DAE).
+    
+    Args:
+        mesh_file: Path to the mesh file (relative or absolute)
+        world_name: Name of the SDF world
+        model_name: Name of the model containing the mesh
+        
+    Returns:
+        ElementTree: SDF XML structure
+    """
+    sdf = ET.Element("sdf", version="1.6")
+    world = ET.SubElement(sdf, "world", name=world_name)
+    
+    # Add basic lighting
+    light = ET.SubElement(world, "light", name="sun", type="directional")
+    ET.SubElement(light, "pose").text = "0 0 10 0 0 0"
+    ET.SubElement(light, "diffuse").text = "0.8 0.8 0.8 1"
+    ET.SubElement(light, "direction").text = "-0.5 0.1 -0.9"
+    
+    # Add ground plane
+    ground = ET.SubElement(world, "model", name="ground_plane")
+    ET.SubElement(ground, "static").text = "true"
+    ground_link = ET.SubElement(ground, "link", name="link")
+    
+    ground_coll = ET.SubElement(ground_link, "collision", name="collision")
+    ground_geom = ET.SubElement(ground_coll, "geometry")
+    ground_plane = ET.SubElement(ground_geom, "plane")
+    ET.SubElement(ground_plane, "normal").text = "0 0 1"
+    ET.SubElement(ground_plane, "size").text = "100 100"
+    
+    ground_vis = ET.SubElement(ground_link, "visual", name="visual")
+    ground_vis_geom = ET.SubElement(ground_vis, "geometry")
+    ground_vis_plane = ET.SubElement(ground_vis_geom, "plane")
+    ET.SubElement(ground_vis_plane, "normal").text = "0 0 1"
+    ET.SubElement(ground_vis_plane, "size").text = "100 100"
+    
+    ground_material = ET.SubElement(ground_vis, "material")
+    ET.SubElement(ground_material, "ambient").text = "0.8 0.8 0.8 1"
+    ET.SubElement(ground_material, "diffuse").text = "0.8 0.8 0.8 1"
+    
+    # Add mesh model (walls from 3D file)
+    mesh_model = ET.SubElement(world, "model", name=model_name)
+    ET.SubElement(mesh_model, "static").text = "true"
+    # Scale from mm (FreeCAD) to meters (Gazebo)
+    ET.SubElement(mesh_model, "pose").text = "0 0 0 0 0 0"
+    
+    mesh_link = ET.SubElement(mesh_model, "link", name="link")
+    
+    # Collision geometry from mesh
+    mesh_coll = ET.SubElement(mesh_link, "collision", name="collision")
+    coll_geom = ET.SubElement(mesh_coll, "geometry")
+    coll_mesh = ET.SubElement(coll_geom, "mesh")
+    ET.SubElement(coll_mesh, "uri").text = mesh_file
+    # Scale from mm to m
+    ET.SubElement(coll_mesh, "scale").text = "0.001 0.001 0.001"
+    
+    # Visual geometry from mesh
+    mesh_vis = ET.SubElement(mesh_link, "visual", name="visual")
+    vis_geom = ET.SubElement(mesh_vis, "geometry")
+    vis_mesh = ET.SubElement(vis_geom, "mesh")
+    ET.SubElement(vis_mesh, "uri").text = mesh_file
+    ET.SubElement(vis_mesh, "scale").text = "0.001 0.001 0.001"
+    
+    # Material
+    material = ET.SubElement(mesh_vis, "material")
+    ET.SubElement(material, "ambient").text = "0.5 0.5 0.5 1"
+    ET.SubElement(material, "diffuse").text = "0.7 0.7 0.7 1"
+    
+    return sdf
+
+
+def pgm_to_freecad_3d(pgm_file, yaml_file, output_dir, wall_height=2.0, 
+                      threshold=128, min_area=10, export_format='step'):
+    """Convert PGM map to 3D model using FreeCAD.
+    
+    Args:
+        pgm_file: Path to PGM map file
+        yaml_file: Path to YAML metadata file
+        output_dir: Output directory for generated files
+        wall_height: Height of walls in meters
+        threshold: Pixel value threshold for wall detection
+        min_area: Minimum contour area to consider
+        export_format: Export format ('step', 'stl', 'obj')
+        
+    Returns:
+        tuple: (path to generated 3D model, path to SDF file) or (None, None) on failure
+    """
+    # Check if FreeCAD is available
+    freecad_cmd = check_freecad_available()
+    if not freecad_cmd:
+        print("Error: FreeCAD CLI not found.")
+        print("Please install FreeCAD and ensure 'freecadcmd' is in your PATH.")
+        print("On Ubuntu: sudo apt install freecad")
+        print("On macOS: brew install freecad")
+        print("On Windows: Download from https://www.freecadweb.org/")
+        return None, None
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate output filenames
+    base_name = os.path.splitext(os.path.basename(pgm_file))[0]
+    
+    if export_format.lower() == 'step':
+        model_ext = '.stp'
+    elif export_format.lower() == 'stl':
+        model_ext = '.stl'
+    else:
+        model_ext = '.stp'
+    
+    output_model = os.path.join(output_dir, f"{base_name}{model_ext}")
+    output_fcstd = os.path.join(output_dir, f"{base_name}.FCStd")
+    output_sdf = os.path.join(output_dir, f"{base_name}.sdf")
+    
+    print(f"Converting: {pgm_file} + {yaml_file}")
+    print(f"Output: {output_model}, {output_sdf}")
+    
+    # Load map data
+    map_array, map_metadata = load_map_data(pgm_file, yaml_file)
+    resolution = map_metadata['resolution']
+    origin = map_metadata['origin']
+    map_height = map_array.shape[0]
+    
+    print(f"Map: {map_array.shape}, Resolution: {resolution}, Origin: {origin}")
+    
+    # Extract contours
+    contours = extract_wall_contours(map_array, threshold, min_area)
+    
+    if not contours:
+        print("Error: No wall contours found in map")
+        return None, None
+    
+    # Convert to world coordinates
+    world_contours = contours_to_world_coords(contours, resolution, origin, map_height)
+    
+    # Generate FreeCAD script
+    script = generate_freecad_script(world_contours, wall_height, output_model, output_fcstd)
+    
+    # Run FreeCAD
+    success = run_freecad_script(script, freecad_cmd)
+    
+    if not success or not os.path.exists(output_model):
+        print("Error: FreeCAD conversion failed")
+        return None, None
+    
+    print(f"Created 3D model: {output_model}")
+    
+    # Create SDF file referencing the mesh
+    # Use relative path for mesh in SDF
+    mesh_relative = os.path.basename(output_model)
+    sdf_root = create_sdf_with_mesh(mesh_relative, model_name=base_name)
+    
+    # Save SDF
+    rough_string = ET.tostring(sdf_root, 'unicode')
+    reparsed = minidom.parseString(rough_string)
+    pretty_xml = reparsed.toprettyxml(indent="  ")
+    pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
+    
+    with open(output_sdf, 'w') as f:
+        f.write(pretty_xml)
+    
+    print(f"Created SDF file: {output_sdf}")
+    
+    return output_model, output_sdf
+
+
+def generate_freecad_script_standalone(pgm_file, yaml_file, output_script, 
+                                       wall_height=2.0, threshold=128, min_area=10):
+    """Generate a standalone FreeCAD Python script without running it.
+    
+    This is useful when FreeCAD is not available on the current system,
+    but the script can be run elsewhere.
+    
+    Args:
+        pgm_file: Path to PGM map file
+        yaml_file: Path to YAML metadata file
+        output_script: Path for the generated Python script
+        wall_height: Height of walls in meters
+        threshold: Pixel value threshold for wall detection
+        min_area: Minimum contour area to consider
+        
+    Returns:
+        str: Path to the generated script
+    """
+    # Load map data
+    map_array, map_metadata = load_map_data(pgm_file, yaml_file)
+    resolution = map_metadata['resolution']
+    origin = map_metadata['origin']
+    map_height = map_array.shape[0]
+    
+    # Extract and convert contours
+    contours = extract_wall_contours(map_array, threshold, min_area)
+    world_contours = contours_to_world_coords(contours, resolution, origin, map_height)
+    
+    # Generate output paths based on script path
+    base_name = os.path.splitext(os.path.basename(output_script))[0]
+    output_dir = os.path.dirname(output_script) or '.'
+    output_step = os.path.join(output_dir, f"{base_name}.stp")
+    output_fcstd = os.path.join(output_dir, f"{base_name}.FCStd")
+    
+    # Generate script
+    script = generate_freecad_script(world_contours, wall_height, output_step, output_fcstd)
+    
+    with open(output_script, 'w') as f:
+        f.write(script)
+    
+    print(f"Generated FreeCAD script: {output_script}")
+    print(f"Run with: freecadcmd {output_script}")
+    
+    return output_script
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert PGM map to 3D model using FreeCAD',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+    # Convert map to 3D model (requires FreeCAD installed)
+    python pgm_to_freecad.py map.pgm map.yaml -o output_dir
+    
+    # Generate FreeCAD script only (can run on another machine)
+    python pgm_to_freecad.py map.pgm map.yaml --script-only -o map_freecad.py
+    
+    # Customize wall height and threshold
+    python pgm_to_freecad.py map.pgm map.yaml --height 3.0 --threshold 100
+        '''
+    )
+    
+    parser.add_argument('pgm_file', help='Path to PGM map file')
+    parser.add_argument('yaml_file', help='Path to YAML metadata file')
+    parser.add_argument('-o', '--output', required=True,
+                        help='Output directory (or script path if --script-only)')
+    parser.add_argument('--height', type=float, default=2.0,
+                        help='Wall height in meters (default: 2.0)')
+    parser.add_argument('--threshold', type=int, default=128,
+                        help='Pixel threshold for wall detection (default: 128)')
+    parser.add_argument('--min-area', type=int, default=10,
+                        help='Minimum contour area in pixels (default: 10)')
+    parser.add_argument('--format', choices=['step', 'stl'], default='step',
+                        help='Export format (default: step)')
+    parser.add_argument('--script-only', action='store_true',
+                        help='Generate FreeCAD script only, without running it')
+    
+    args = parser.parse_args()
+    
+    # Validate input files
+    if not os.path.exists(args.pgm_file):
+        print(f"Error: PGM file not found: {args.pgm_file}")
+        sys.exit(1)
+    if not os.path.exists(args.yaml_file):
+        print(f"Error: YAML file not found: {args.yaml_file}")
+        sys.exit(1)
+    
+    if args.script_only:
+        # Generate script only
+        generate_freecad_script_standalone(
+            args.pgm_file,
+            args.yaml_file,
+            args.output,
+            wall_height=args.height,
+            threshold=args.threshold,
+            min_area=args.min_area
+        )
+    else:
+        # Full conversion
+        model_path, sdf_path = pgm_to_freecad_3d(
+            args.pgm_file,
+            args.yaml_file,
+            args.output,
+            wall_height=args.height,
+            threshold=args.threshold,
+            min_area=args.min_area,
+            export_format=args.format
+        )
+        
+        if model_path and sdf_path:
+            print("\nConversion successful!")
+            print(f"3D Model: {model_path}")
+            print(f"SDF File: {sdf_path}")
+        else:
+            print("\nConversion failed.")
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

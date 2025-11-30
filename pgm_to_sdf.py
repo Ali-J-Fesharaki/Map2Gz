@@ -1071,7 +1071,8 @@ def create_sdf_world(walls, world_name="slam_world"):
 
 
 def simple_pgm_to_sdf(pgm_file, yaml_file, output_sdf, wall_height=2.0, wall_thickness=0.1, 
-                      threshold=128, sensitivity=1.0, method='hough', min_area=10, approx_epsilon=2.0):
+                      threshold=128, sensitivity=1.0, method='hough', min_area=10, approx_epsilon=2.0,
+                      freecad_script_only=False):
     """
     Convert PGM/YAML to SDF with selectable detection method.
     
@@ -1083,16 +1084,56 @@ def simple_pgm_to_sdf(pgm_file, yaml_file, output_sdf, wall_height=2.0, wall_thi
         wall_thickness: Thickness of walls (only used for 'hough' method)
         threshold: Pixel value threshold for wall detection
         sensitivity: Line detection sensitivity (only for 'hough' method)
-        method: Detection method - 'hough', 'contour', 'pixel', or 'rle'
+        method: Detection method - 'hough', 'contour', 'pixel', 'rle', or 'freecad'
             - 'hough': Uses Hough line detection (good for noisy SLAM maps)
             - 'contour': Uses contour detection (good for clean maps with thick walls)
             - 'pixel': Uses connected components (for simple maps)
             - 'rle': Uses run-length encoding (BEST for orthogonal/grid mazes)
-        min_area: Minimum contour area (for 'contour' and 'pixel' methods)
+            - 'freecad': Uses FreeCAD to create 3D model from contours (exports STEP + SDF)
+        min_area: Minimum contour area (for 'contour', 'pixel', and 'freecad' methods)
         approx_epsilon: Contour approximation (for 'contour' method)
+        freecad_script_only: If True and method='freecad', only generate FreeCAD script
     """
     print(f"Converting: {pgm_file} + {yaml_file} -> {output_sdf}")
     print(f"Method: {method}")
+    
+    # Handle FreeCAD method separately
+    if method == 'freecad':
+        try:
+            from pgm_to_freecad import pgm_to_freecad_3d, generate_freecad_script_standalone
+        except ImportError:
+            raise ImportError("pgm_to_freecad module not found. Ensure pgm_to_freecad.py is in the same directory.")
+        
+        output_dir = os.path.dirname(output_sdf) or '.'
+        
+        if freecad_script_only:
+            # Generate script only
+            script_path = output_sdf.replace('.sdf', '_freecad.py')
+            generate_freecad_script_standalone(
+                pgm_file, yaml_file, script_path,
+                wall_height=wall_height,
+                threshold=threshold,
+                min_area=min_area
+            )
+            print(f"Generated FreeCAD script: {script_path}")
+            return script_path
+        else:
+            # Full FreeCAD conversion
+            model_path, sdf_path = pgm_to_freecad_3d(
+                pgm_file, yaml_file, output_dir,
+                wall_height=wall_height,
+                threshold=threshold,
+                min_area=min_area,
+                export_format='step'
+            )
+            if sdf_path:
+                # Move/rename if output path differs
+                if sdf_path != output_sdf and os.path.exists(sdf_path):
+                    import shutil
+                    shutil.move(sdf_path, output_sdf)
+                return output_sdf
+            else:
+                raise RuntimeError("FreeCAD conversion failed. Ensure FreeCAD CLI is installed.")
     
     # 1. Load map data
     map_array, map_metadata = load_map_data(pgm_file, yaml_file)
@@ -1128,7 +1169,7 @@ def simple_pgm_to_sdf(pgm_file, yaml_file, output_sdf, wall_height=2.0, wall_thi
         walls = create_walls_from_rectangles(world_rects, wall_height)
         
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'hough', 'contour', 'pixel', or 'rle'")
+        raise ValueError(f"Unknown method: {method}. Use 'hough', 'contour', 'pixel', 'rle', or 'freecad'")
     
     # 3. Generate SDF
     sdf_root = create_simple_sdf(walls)
@@ -1197,7 +1238,8 @@ def process_directory(input_dir, output_dir, args):
                 sensitivity=args.sensitivity,
                 method=args.method,
                 min_area=args.min_area,
-                approx_epsilon=args.approx_epsilon
+                approx_epsilon=args.approx_epsilon,
+                freecad_script_only=getattr(args, 'freecad_script_only', False)
             )
             success_count += 1
             
@@ -1216,10 +1258,12 @@ def main():
     parser.add_argument('--thickness', type=float, default=0.1, help='Wall thickness (default: 0.1m, only for hough method)')
     parser.add_argument('--threshold', type=int, default=128, help='Wall threshold (default: 128)')
     parser.add_argument('--sensitivity', type=float, default=1.0, help='Line detection sensitivity (default: 1.0, only for hough method)')
-    parser.add_argument('--method', choices=['hough', 'contour', 'pixel', 'rle'], default='rle',
-                       help='Detection method: hough (SLAM maps), contour (clean maps), pixel (simple maps), rle (orthogonal mazes - RECOMMENDED)')
-    parser.add_argument('--min-area', type=int, default=10, help='Minimum contour area (default: 10, for contour/pixel methods)')
+    parser.add_argument('--method', choices=['hough', 'contour', 'pixel', 'rle', 'freecad'], default='rle',
+                       help='Detection method: hough (SLAM maps), contour (clean maps), pixel (simple maps), rle (orthogonal mazes - RECOMMENDED), freecad (3D model via FreeCAD)')
+    parser.add_argument('--min-area', type=int, default=10, help='Minimum contour area (default: 10, for contour/pixel/freecad methods)')
     parser.add_argument('--approx-epsilon', type=float, default=2.0, help='Contour approximation epsilon (default: 2.0)')
+    parser.add_argument('--freecad-script-only', action='store_true',
+                       help='For freecad method: generate FreeCAD Python script only, without running it (useful when FreeCAD is not installed)')
 
     args = parser.parse_args()
 
@@ -1256,7 +1300,8 @@ def main():
             sensitivity=args.sensitivity,
             method=args.method,
             min_area=args.min_area,
-            approx_epsilon=args.approx_epsilon
+            approx_epsilon=args.approx_epsilon,
+            freecad_script_only=getattr(args, 'freecad_script_only', False)
         )
         print("Success!")
         
