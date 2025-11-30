@@ -490,7 +490,13 @@ def capture_frames(sdf_file, output_gif, frames=60, radius=15.0, height=10.0, cm
     
     # Launch Gazebo
     print(f"Launching Gazebo with {sdf_abs_path}...")
-    gz_process = subprocess.Popen([cmd, 'gazebo', sdf_abs_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Set NVIDIA environment variables for proper GPU rendering
+    env = os.environ.copy()
+    env["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+    env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    
+    gz_process = subprocess.Popen([cmd, 'gazebo', sdf_abs_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     
     try:
         # Wait for Gazebo to load and services to be ready

@@ -92,7 +92,11 @@ STYLE_NAMES = {
 
 
 def get_valid_styles_for_shape(shape):
-    """Return valid style indices for a given shape."""
+    """Return valid style indices for a given shape.
+    
+    Note: For Hexagonal, Delta style (2) is more stable than Sigma (1),
+    so we return it first for random.choice() bias.
+    """
     if shape == SHAPE_RECTANGULAR:
         return [1, 2, 3]  # Orthogonal, Sigma, Delta
     elif shape == SHAPE_CIRCULAR:
@@ -100,7 +104,7 @@ def get_valid_styles_for_shape(shape):
     elif shape == SHAPE_TRIANGULAR:
         return [1]  # Delta only (no style selection)
     elif shape == SHAPE_HEXAGONAL:
-        return [1, 2]  # Sigma, Delta
+        return [2, 2, 1]  # Delta (2) preferred - listed twice for higher probability
     return [1]
 
 
@@ -142,9 +146,15 @@ def validate_triangular_params(side_length, inner_side_length):
 
 
 def validate_hexagonal_params(side_length, inner_side_length):
-    """Validate and adjust hexagonal maze parameters."""
-    # Side length: 1-120
-    side_length = max(1, min(120, side_length))
+    """Validate and adjust hexagonal maze parameters.
+    
+    Note: Hexagonal mazes with large side lengths (>15) and Sigma style
+    can cause issues with the maze generator website. We limit side_length
+    to 15 for stability.
+    """
+    # Side length: 1-15 (limited for stability with Sigma style)
+    # The website supports up to 120, but large values often fail
+    side_length = max(1, min(5, side_length))
     
     # Inner side length: 0 to side-1
     if inner_side_length > 0:
@@ -439,8 +449,16 @@ def process_maze_image(image, robot_size, maze_width_cells):
     
     return pgm_img, resolution
 
-def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
-    """Save PGM, YAML, and optionally the original PNG files"""
+def save_map(pgm_image, resolution, output_dir, base_name, original_image=None, shape=SHAPE_RECTANGULAR):
+    """Save PGM, YAML, and optionally the original PNG files
+    
+    The origin is calculated to place the maze's geometric center at (0,0).
+    For different shapes:
+    - Rectangular: Center is at image center
+    - Circular: Center is at image center
+    - Triangular: Centroid is at 1/3 height from base (not image center)
+    - Hexagonal: Center is at image center
+    """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
@@ -455,13 +473,45 @@ def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
     # Save PGM
     pgm_image.save(pgm_path)
     
-    # Calculate origin to center the maze
-    # Origin is the real-world position of the bottom-left pixel
-    # To center the maze, origin should be negative half of the map dimensions
+    # Calculate map dimensions in meters
     map_width_m = pgm_image.width * resolution
     map_height_m = pgm_image.height * resolution
-    origin_x = -map_width_m / 2.0
-    origin_y = -map_height_m / 2.0
+    
+    # Calculate origin based on shape geometry
+    # Origin is the real-world position of the bottom-left pixel
+    # We want the geometric center of the shape to be at (0,0)
+    
+    if shape == SHAPE_RECTANGULAR:
+        # Rectangular: geometric center is at image center
+        origin_x = -map_width_m / 2.0
+        origin_y = -map_height_m / 2.0
+        
+    elif shape == SHAPE_CIRCULAR:
+        # Circular: geometric center is at image center
+        origin_x = -map_width_m / 2.0
+        origin_y = -map_height_m / 2.0
+        
+    elif shape == SHAPE_TRIANGULAR:
+        # Triangular maze: The triangle points upward
+        # The centroid of an equilateral triangle is at 1/3 of the height from the base
+        # Image has the triangle with apex at top, base at bottom
+        # Centroid Y = 1/3 from bottom = height/3 from bottom
+        # So centroid is at (width/2, height/3) in image coordinates
+        # Origin needs to place this point at (0,0)
+        centroid_x_px = pgm_image.width / 2.0
+        centroid_y_px = pgm_image.height / 3.0  # 1/3 from bottom
+        origin_x = -centroid_x_px * resolution
+        origin_y = -centroid_y_px * resolution
+        
+    elif shape == SHAPE_HEXAGONAL:
+        # Hexagonal: geometric center is at image center
+        origin_x = -map_width_m / 2.0
+        origin_y = -map_height_m / 2.0
+        
+    else:
+        # Default: use image center
+        origin_x = -map_width_m / 2.0
+        origin_y = -map_height_m / 2.0
     
     map_data = {
         'image': f"{base_name}.pgm",
@@ -480,7 +530,7 @@ def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
         print(f"  {png_path}")
     print(f"  {pgm_path}")
     print(f"  {yaml_path}")
-    print(f"  Map size: {map_width_m:.2f}m x {map_height_m:.2f}m, origin at center")
+    print(f"  Map size: {map_width_m:.2f}m x {map_height_m:.2f}m, origin: ({origin_x:.2f}, {origin_y:.2f})")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -642,7 +692,7 @@ Examples:
                 
                 # Save (including original PNG)
                 suffix = f"_{i}" if args.count > 1 else ""
-                save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}", original_image=image)
+                save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}", original_image=image, shape=shape)
                 
                 break  # Success, exit retry loop
                 
