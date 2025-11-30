@@ -65,12 +65,13 @@ We tested various methods on exact orthogonal mazes. Here is why **RLE** is the 
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--method` | `hough` | Detection algorithm: `rle` (exact), `contour` (shapes), `hough` (lines), `pixel` (grid) |
+| `--method` | `rle` | Detection algorithm: `rle` (exact), `contour` (shapes), `hough` (lines), `pixel` (grid), `freecad` (3D model) |
 | `--output` / `-o` | `slam_world.sdf` | Output SDF filename |
 | `--height` | `2.0` | Wall height in meters |
 | `--thickness` | `0.1` | Wall thickness in meters (Hough/Contour only) |
 | `--threshold` | `128` | Pixel threshold (0-255) for wall detection |
 | `--sensitivity` | `1.0` | Line detection sensitivity (Hough only) |
+| `--freecad-script-only` | `false` | Generate FreeCAD Python script without running it (FreeCAD method only) |
 
 ## :wrench: How It Works
 
@@ -79,8 +80,36 @@ We tested various methods on exact orthogonal mazes. Here is why **RLE** is the 
     *   *RLE:* Scans pixels row-by-row to create exact blocks.
     *   *Hough:* Probabilistic line detection to approximate walls.
     *   *Contour:* Traces the outline of obstacles.
+    *   *FreeCAD:* Converts contours to 3D model via FreeCAD CLI.
 3.  **Scale to World** :earth_americas: - Converts pixel coordinates to real-world meters using YAML resolution.
 4.  **Generate SDF** :outbox_tray: - Outputs a Gazebo-compatible world file with collision and visual elements.
+
+## :triangular_ruler: FreeCAD Method (3D Model Export)
+
+The `freecad` method provides an alternative approach using FreeCAD CLI to create true 3D models:
+
+```bash
+# Convert map to 3D model (requires FreeCAD installed)
+python pgm_to_sdf.py map.pgm map.yaml --method freecad
+
+# Generate FreeCAD script only (can run on another machine with FreeCAD)
+python pgm_to_sdf.py map.pgm map.yaml --method freecad --freecad-script-only
+```
+
+**Features:**
+- Creates STEP (.stp) files that can be used in CAD software
+- Supports curved walls and complex geometries
+- Exports FreeCAD document (.FCStd) for further editing
+- Generates SDF file that references the 3D mesh
+
+**Requirements:**
+- FreeCAD with CLI support (`freecadcmd` or `FreeCADCmd`)
+- Install: `sudo apt install freecad` (Ubuntu) or `brew install freecad` (macOS)
+
+You can also use the standalone converter:
+```bash
+python pgm_to_freecad.py map.pgm map.yaml -o output_directory
+```
 
 ## :soon: Future Roadmap
 
