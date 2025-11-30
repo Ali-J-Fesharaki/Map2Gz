@@ -1,4 +1,8 @@
 **/*.png
+!pics/**/*.png
+**/*.yaml
+**/*.pgm
+**/*.sdf
 **/*.jpg
 **/*.jpeg
 **/*.gif

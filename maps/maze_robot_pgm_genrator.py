@@ -8,8 +8,46 @@ to a ROS 2 compatible PGM/YAML map.
 The map resolution is calculated based on the robot's footprint to ensure the 
 maze is solvable (corridors are wide enough).
 
+Supported Shapes and Parameters:
+--------------------------------
+1. Rectangular (shape=1):
+   - Styles: 1=Orthogonal (square cells), 2=Sigma (hexagonal cells), 3=Delta (triangular cells)
+   - Width: 2-200 cells
+   - Height: 2-200 cells
+   - Inner Width: 0 or 2 to (width-2) cells
+   - Inner Height: 0 or 2 to (height-2) cells
+   - Starts At: 1=Top, 2=Bottom
+
+2. Circular/Theta (shape=2):
+   - No style option (always theta maze)
+   - Outer Diameter: 5-200 cells
+   - Inner Diameter: 3 to (outer-2), difference must be even
+   - Starts At: 1=Outer edge, 2=Center
+
+3. Triangular (shape=3):
+   - No style option (always delta/triangular cells)
+   - Side Length: 3-200 cells
+   - Inner Side Length: 0, or 3+ with (side - inner_side) divisible by 3
+   - Starts At: 1=Top, 2=Bottom/Inner
+
+4. Hexagonal (shape=4):
+   - Styles: 1=Sigma (hexagonal cells), 2=Delta (triangular cells)
+   - Side Length: 1-120 cells
+   - Inner Side Length: 0 to (side-1)
+   - Starts At: 1=Outer edge, 2=Center
+
 Usage:
+    # Rectangular maze (default)
     python3 maze_robot_pgm_genrator.py --width 20 --height 20 --robot-size 0.5
+    
+    # Circular/Theta maze
+    python3 maze_robot_pgm_genrator.py --shape 2 --outer-diameter 20 --inner-diameter 5
+    
+    # Triangular maze
+    python3 maze_robot_pgm_genrator.py --shape 3 --side-length 20
+    
+    # Hexagonal maze with sigma style
+    python3 maze_robot_pgm_genrator.py --shape 4 --side-length 10 --style 1
 """
 
 import os
@@ -25,11 +63,187 @@ import cairosvg
 from PIL import Image
 from io import BytesIO
 
-def generate_maze_image(width, height, shape_idx=1, style_idx=1, inner_width=0, inner_height=0, starts_at=1, e_val=50, r_val=100):
+# Shape constants
+SHAPE_RECTANGULAR = 1
+SHAPE_CIRCULAR = 2
+SHAPE_TRIANGULAR = 3
+SHAPE_HEXAGONAL = 4
+
+# Style constants for rectangular mazes
+STYLE_ORTHOGONAL = 1  # Square cells
+STYLE_SIGMA = 2       # Hexagonal cells
+STYLE_DELTA = 3       # Triangular cells
+
+# Shape name mapping
+SHAPE_NAMES = {
+    SHAPE_RECTANGULAR: "Rectangular",
+    SHAPE_CIRCULAR: "Circular/Theta",
+    SHAPE_TRIANGULAR: "Triangular",
+    SHAPE_HEXAGONAL: "Hexagonal"
+}
+
+# Style name mapping per shape
+STYLE_NAMES = {
+    SHAPE_RECTANGULAR: {1: "Orthogonal", 2: "Sigma", 3: "Delta"},
+    SHAPE_CIRCULAR: {1: "Theta"},
+    SHAPE_TRIANGULAR: {1: "Delta"},
+    SHAPE_HEXAGONAL: {1: "Sigma", 2: "Delta"}
+}
+
+
+def get_valid_styles_for_shape(shape):
+    """Return valid style indices for a given shape."""
+    if shape == SHAPE_RECTANGULAR:
+        return [1, 2, 3]  # Orthogonal, Sigma, Delta
+    elif shape == SHAPE_CIRCULAR:
+        return [1]  # Theta only (no style selection)
+    elif shape == SHAPE_TRIANGULAR:
+        return [1]  # Delta only (no style selection)
+    elif shape == SHAPE_HEXAGONAL:
+        return [1, 2]  # Sigma, Delta
+    return [1]
+
+
+def validate_circular_params(outer_diameter, inner_diameter):
+    """Validate and adjust circular maze parameters."""
+    # Outer diameter: 5-200
+    outer_diameter = max(5, min(200, outer_diameter))
+    
+    # Inner diameter: 3 to outer-2, difference must be even
+    if inner_diameter > 0:
+        inner_diameter = max(3, min(outer_diameter - 2, inner_diameter))
+        # Ensure difference is even
+        diff = outer_diameter - inner_diameter
+        if diff % 2 != 0:
+            inner_diameter -= 1
+        inner_diameter = max(3, inner_diameter)
+    
+    return outer_diameter, inner_diameter
+
+
+def validate_triangular_params(side_length, inner_side_length):
+    """Validate and adjust triangular maze parameters."""
+    # Side length: 3-200
+    side_length = max(3, min(200, side_length))
+    
+    # Inner side length: 0, or 3+ with (side - inner_side) divisible by 3
+    if inner_side_length > 0:
+        inner_side_length = max(3, inner_side_length)
+        diff = side_length - inner_side_length
+        if diff < 3:
+            inner_side_length = 0
+        elif diff % 3 != 0:
+            # Adjust to make divisible by 3
+            inner_side_length = side_length - ((diff // 3) * 3)
+            if inner_side_length < 3:
+                inner_side_length = 0
+    
+    return side_length, inner_side_length
+
+
+def validate_hexagonal_params(side_length, inner_side_length):
+    """Validate and adjust hexagonal maze parameters."""
+    # Side length: 1-120
+    side_length = max(1, min(120, side_length))
+    
+    # Inner side length: 0 to side-1
+    if inner_side_length > 0:
+        inner_side_length = max(1, min(side_length - 1, inner_side_length))
+    
+    return side_length, inner_side_length
+
+
+def validate_rectangular_params(width, height, inner_width, inner_height):
+    """Validate and adjust rectangular maze parameters."""
+    # Width/Height: 2-200
+    width = max(2, min(200, width))
+    height = max(2, min(200, height))
+    
+    # Inner width: 0 or 2 to width-2
+    if inner_width > 0:
+        inner_width = max(2, min(width - 2, inner_width))
+    
+    # Inner height: 0 or 2 to height-2
+    if inner_height > 0:
+        inner_height = max(2, min(height - 2, inner_height))
+    
+    return width, height, inner_width, inner_height
+
+
+def build_form_data(shape, style, params, starts_at, e_val, r_val, viewstate, viewstategen, eventvalidation):
+    """
+    Build the form data dictionary for the POST request based on shape.
+    
+    Different shapes use different form field names on mazegenerator.net.
+    """
+    data = {
+        "__VIEWSTATE": viewstate,
+        "__VIEWSTATEGENERATOR": viewstategen if viewstategen else "",
+        "__EVENTVALIDATION": eventvalidation,
+        "ShapeDropDownList": str(shape),
+        "AlgorithmParameter1TextBox": str(e_val),
+        "AlgorithmParameter2TextBox": str(r_val),
+        "GenerateButton": "Generate"
+    }
+    
+    if shape == SHAPE_RECTANGULAR:
+        width, height, inner_width, inner_height = params
+        data.update({
+            "S1TesselationDropDownList": str(style),
+            "S1WidthTextBox": str(width),
+            "S1HeightTextBox": str(height),
+            "S1InnerWidthTextBox": str(inner_width),
+            "S1InnerHeightTextBox": str(inner_height),
+            "S1StartsAtDropDownList": str(starts_at),
+        })
+    elif shape == SHAPE_CIRCULAR:
+        outer_diameter, inner_diameter = params
+        data.update({
+            "S2OuterDiameterTextBox": str(outer_diameter),
+            "S2InnerDiameterTextBox": str(inner_diameter),
+            "S2StartsAtDropDownList": str(starts_at),
+        })
+    elif shape == SHAPE_TRIANGULAR:
+        side_length, inner_side_length = params
+        data.update({
+            "S3SideLengthTextBox": str(side_length),
+            "S3InnerSideLengthTextBox": str(inner_side_length),
+            "S3StartsAtDropDownList": str(starts_at),
+        })
+    elif shape == SHAPE_HEXAGONAL:
+        side_length, inner_side_length = params
+        data.update({
+            "S4TesselationDropDownList": str(style),
+            "S4SideLengthTextBox": str(side_length),
+            "S4InnerSideLengthTextBox": str(inner_side_length),
+            "S4StartsAtDropDownList": str(starts_at),
+        })
+    
+    return data
+
+
+def generate_maze_image(shape=1, style=1, params=None, starts_at=1, e_val=50, r_val=100):
     """
     Interact with mazegenerator.net to generate a maze using requests.
-    Returns the PIL Image of the maze.
+    
+    Args:
+        shape: Shape index (1=Rectangular, 2=Circular, 3=Triangular, 4=Hexagonal)
+        style: Style index (depends on shape)
+        params: Tuple of size parameters depending on shape:
+            - Rectangular: (width, height, inner_width, inner_height)
+            - Circular: (outer_diameter, inner_diameter)
+            - Triangular: (side_length, inner_side_length)
+            - Hexagonal: (side_length, inner_side_length)
+        starts_at: 1=Top/Outer, 2=Bottom/Center
+        e_val: Elitism parameter (0-100)
+        r_val: River parameter (0-100)
+    
+    Returns:
+        PIL Image of the maze.
     """
+    if params is None:
+        params = (20, 20, 0, 0)  # Default rectangular params
+    
     url = "https://www.mazegenerator.net/"
     s = requests.Session()
     s.headers.update({
@@ -40,30 +254,71 @@ def generate_maze_image(width, height, shape_idx=1, style_idx=1, inner_width=0, 
     r = s.get(url)
     
     # Extract hidden fields
-    viewstate = re.search(r'id="__VIEWSTATE" value="([^"]+)"', r.text)
-    viewstategen = re.search(r'id="__VIEWSTATEGENERATOR" value="([^"]+)"', r.text)
-    eventvalidation = re.search(r'id="__EVENTVALIDATION" value="([^"]+)"', r.text)
+    def extract_form_fields(html):
+        viewstate = re.search(r'id="__VIEWSTATE" value="([^"]+)"', html)
+        viewstategen = re.search(r'id="__VIEWSTATEGENERATOR" value="([^"]+)"', html)
+        eventvalidation = re.search(r'id="__EVENTVALIDATION" value="([^"]+)"', html)
+        return viewstate, viewstategen, eventvalidation
+    
+    viewstate, viewstategen, eventvalidation = extract_form_fields(r.text)
     
     if not viewstate or not eventvalidation:
         raise Exception("Failed to parse form fields from website")
 
-    data = {
-        "__VIEWSTATE": viewstate.group(1),
-        "__VIEWSTATEGENERATOR": viewstategen.group(1) if viewstategen else "",
-        "__EVENTVALIDATION": eventvalidation.group(1),
-        "ShapeDropDownList": str(shape_idx),
-        "S1TesselationDropDownList": str(style_idx),
-        "S1WidthTextBox": str(width),
-        "S1HeightTextBox": str(height),
-        "S1InnerWidthTextBox": str(inner_width),
-        "S1InnerHeightTextBox": str(inner_height),
-        "S1StartsAtDropDownList": str(starts_at),
-        "AlgorithmParameter1TextBox": str(e_val),
-        "AlgorithmParameter2TextBox": str(r_val),
-        "GenerateButton": "Generate"
-    }
+    # For non-rectangular shapes, we need to first change the shape via postback
+    # This updates the form to show the correct fields for that shape
+    if shape != SHAPE_RECTANGULAR:
+        # First POST: Change the shape (triggers ASP.NET postback)
+        shape_change_data = {
+            "__VIEWSTATE": viewstate.group(1),
+            "__VIEWSTATEGENERATOR": viewstategen.group(1) if viewstategen else "",
+            "__EVENTVALIDATION": eventvalidation.group(1),
+            "__EVENTTARGET": "ShapeDropDownList",
+            "__EVENTARGUMENT": "",
+            "ShapeDropDownList": str(shape),
+            "S1TesselationDropDownList": "1",
+            "S1WidthTextBox": "20",
+            "S1HeightTextBox": "20",
+            "S1InnerWidthTextBox": "0",
+            "S1InnerHeightTextBox": "0",
+            "S1StartsAtDropDownList": "1",
+            "AlgorithmParameter1TextBox": str(e_val),
+            "AlgorithmParameter2TextBox": str(r_val),
+        }
+        
+        r_shape = s.post(url, data=shape_change_data)
+        
+        # Extract the new form fields after shape change
+        viewstate, viewstategen, eventvalidation = extract_form_fields(r_shape.text)
+        
+        if not viewstate or not eventvalidation:
+            raise Exception("Failed to parse form fields after shape change")
     
-    print(f"Generating maze ({width}x{height}, Shape:{shape_idx}, Style:{style_idx})...")
+    # Build form data based on shape
+    data = build_form_data(
+        shape=shape,
+        style=style,
+        params=params,
+        starts_at=starts_at,
+        e_val=e_val,
+        r_val=r_val,
+        viewstate=viewstate.group(1),
+        viewstategen=viewstategen.group(1) if viewstategen else "",
+        eventvalidation=eventvalidation.group(1)
+    )
+    
+    # Create descriptive log message based on shape
+    shape_name = SHAPE_NAMES.get(shape, f"Shape {shape}")
+    style_name = STYLE_NAMES.get(shape, {}).get(style, f"Style {style}")
+    
+    if shape == SHAPE_RECTANGULAR:
+        size_desc = f"{params[0]}x{params[1]}"
+    elif shape == SHAPE_CIRCULAR:
+        size_desc = f"outer={params[0]}, inner={params[1]}"
+    else:
+        size_desc = f"side={params[0]}, inner={params[1]}"
+    
+    print(f"Generating maze ({shape_name}, {style_name}, {size_desc})...")
     r_post = s.post(url, data=data)
     
     # Find image URL
@@ -167,16 +422,21 @@ def process_maze_image(image, robot_size, maze_width_cells):
     
     return pgm_img, resolution
 
-def save_map(image, resolution, output_dir, base_name):
-    """Save PGM and YAML files"""
+def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
+    """Save PGM, YAML, and optionally the original PNG files"""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
     pgm_path = os.path.join(output_dir, f"{base_name}.pgm")
     yaml_path = os.path.join(output_dir, f"{base_name}.yaml")
+    png_path = os.path.join(output_dir, f"{base_name}.png")
+    
+    # Save original PNG if provided
+    if original_image is not None:
+        original_image.save(png_path)
     
     # Save PGM
-    image.save(pgm_path)
+    pgm_image.save(pgm_path)
     
     # Create YAML
     # Origin: [x, y, yaw]
@@ -197,11 +457,46 @@ def save_map(image, resolution, output_dir, base_name):
         yaml.dump(map_data, f, default_flow_style=False)
         
     print(f"Saved map to:")
+    if original_image is not None:
+        print(f"  {png_path}")
     print(f"  {pgm_path}")
     print(f"  {yaml_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate ROS PGM map from mazegenerator.net")
+    parser = argparse.ArgumentParser(
+        description="Generate ROS PGM map from mazegenerator.net",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Shapes and their parameters:
+  1. Rectangular: --width, --height, --inner-width, --inner-height
+                  Styles: 1=Orthogonal, 2=Sigma, 3=Delta
+  2. Circular:    --outer-diameter, --inner-diameter
+                  No style options (always Theta)
+  3. Triangular:  --side-length, --inner-side-length
+                  No style options (always Delta)
+  4. Hexagonal:   --side-length, --inner-side-length
+                  Styles: 1=Sigma, 2=Delta
+
+Examples:
+  # Rectangular orthogonal maze
+  python3 maze_robot_pgm_genrator.py --shape 1 --width 20 --height 20 --style 1
+  
+  # Circular theta maze
+  python3 maze_robot_pgm_genrator.py --shape 2 --outer-diameter 20 --inner-diameter 5
+  
+  # Triangular maze
+  python3 maze_robot_pgm_genrator.py --shape 3 --side-length 20
+  
+  # Hexagonal sigma maze
+  python3 maze_robot_pgm_genrator.py --shape 4 --side-length 10 --style 1
+  
+  # Random shape and style (default behavior)
+  python3 maze_robot_pgm_genrator.py
+  
+  # Force rectangular shape only
+  python3 maze_robot_pgm_genrator.py --no-random-shape
+        """
+    )
     
     # General
     parser.add_argument("-n", "--count", type=int, default=1, help="Number of maps to generate")
@@ -211,24 +506,39 @@ def main():
     # Robot Parameters
     parser.add_argument("--robot-size", type=float, default=0.5, help="Robot footprint diameter (meters)")
     
-    # Maze Parameters
-    parser.add_argument("--width", type=int, default=20, help="Maze width in cells")
-    parser.add_argument("--height", type=int, default=20, help="Maze height in cells")
-    parser.add_argument("--inner-width", type=int, default=0, help="Inner room width in cells")
-    parser.add_argument("--inner-height", type=int, default=0, help="Inner room height in cells")
-    
+    # Shape Selection
     parser.add_argument("--shape", type=int, choices=[1, 2, 3, 4], 
-                        help="Shape (1=Rect, 2=Circ, 3=Tri, 4=Hex). Default: Random (Rect only for now)")
+                        help="Shape: 1=Rectangular, 2=Circular, 3=Triangular, 4=Hexagonal. Default: Random")
+    parser.add_argument("--no-random-shape", action="store_true",
+                        help="Disable random shape selection (use Rectangular by default)")
+    
+    # Style (for Rectangular and Hexagonal)
     parser.add_argument("--style", type=int, choices=[1, 2, 3], 
-                        help="Style (1=Ortho, 2=Sigma, 3=Delta). Default: Random")
+                        help="Style (shape-dependent): Rect: 1=Ortho, 2=Sigma, 3=Delta; Hex: 1=Sigma, 2=Delta. Default: Random")
     
+    # Rectangular Maze Parameters (Shape 1)
+    parser.add_argument("--width", type=int, default=20, help="[Rectangular] Maze width in cells (2-200)")
+    parser.add_argument("--height", type=int, default=20, help="[Rectangular] Maze height in cells (2-200)")
+    parser.add_argument("--inner-width", type=int, default=0, help="[Rectangular] Inner room width (0 or 2 to width-2)")
+    parser.add_argument("--inner-height", type=int, default=0, help="[Rectangular] Inner room height (0 or 2 to height-2)")
+    
+    # Circular Maze Parameters (Shape 2)
+    parser.add_argument("--outer-diameter", type=int, default=20, help="[Circular] Outer diameter in cells (5-200)")
+    parser.add_argument("--inner-diameter", type=int, default=0, help="[Circular] Inner diameter (0, or 3 to outer-2, diff must be even)")
+    
+    # Triangular Maze Parameters (Shape 3)
+    parser.add_argument("--side-length", type=int, default=20, help="[Triangular/Hexagonal] Side length in cells")
+    parser.add_argument("--inner-side-length", type=int, default=0, help="[Triangular/Hexagonal] Inner side length")
+    
+    # Common Parameters
     parser.add_argument("--starts-at", type=int, choices=[1, 2], 
-                        help="Starts At (1=Top, 2=Bottom/Inner). Default: Random")
+                        help="Starts At: 1=Top/Outer, 2=Bottom/Center. Default: Random")
     
-    parser.add_argument("--e", type=int, help="Elitism (0-100). Default: Random")
-    parser.add_argument("--r", type=int, help="River (0-100). Default: Random")
+    # Algorithm Parameters
+    parser.add_argument("--e", type=int, help="Elitism (0-100): Low=solution uses more cells. Default: Random")
+    parser.add_argument("--r", type=int, help="River (0-100): High=fewer but longer dead ends. Default: Random")
     
-    parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
     
     args = parser.parse_args()
     
@@ -242,14 +552,49 @@ def main():
     for i in range(args.count):
         print(f"\n--- Generating Maze {i+1}/{args.count} ---")
         
-        # Determine parameters for this iteration
-        # Shape: Currently defaulting to 1 (Rect) because other shapes might use different form fields
-        # If user explicitly sets shape, we try it. If not, we stick to 1 to be safe.
-        shape = args.shape if args.shape is not None else 1 
+        # Determine shape (random by default if not specified)
+        if args.shape is not None:
+            shape = args.shape
+        elif args.no_random_shape:
+            shape = SHAPE_RECTANGULAR
+        else:
+            shape = random.choice([SHAPE_RECTANGULAR, SHAPE_CIRCULAR, SHAPE_TRIANGULAR, SHAPE_HEXAGONAL])
         
-        # Style: Random if not set
-        # Valid styles depend on shape, but for Rect (1), all 3 are valid.
-        style = args.style if args.style is not None else random.choice([1, 2, 3])
+        # Determine style based on shape
+        valid_styles = get_valid_styles_for_shape(shape)
+        if args.style is not None and args.style in valid_styles:
+            style = args.style
+        else:
+            style = random.choice(valid_styles)
+        
+        # Determine size parameters based on shape
+        if shape == SHAPE_RECTANGULAR:
+            width, height, inner_width, inner_height = validate_rectangular_params(
+                args.width, args.height, args.inner_width, args.inner_height
+            )
+            params = (width, height, inner_width, inner_height)
+            maze_size_for_resolution = width  # Use width for resolution calculation
+            
+        elif shape == SHAPE_CIRCULAR:
+            outer_diameter, inner_diameter = validate_circular_params(
+                args.outer_diameter, args.inner_diameter
+            )
+            params = (outer_diameter, inner_diameter)
+            maze_size_for_resolution = outer_diameter
+            
+        elif shape == SHAPE_TRIANGULAR:
+            side_length, inner_side_length = validate_triangular_params(
+                args.side_length, args.inner_side_length
+            )
+            params = (side_length, inner_side_length)
+            maze_size_for_resolution = side_length
+            
+        elif shape == SHAPE_HEXAGONAL:
+            side_length, inner_side_length = validate_hexagonal_params(
+                args.side_length, args.inner_side_length
+            )
+            params = (side_length, inner_side_length)
+            maze_size_for_resolution = side_length
         
         # Starts At: Random if not set
         starts_at = args.starts_at if args.starts_at is not None else random.choice([1, 2])
@@ -261,28 +606,25 @@ def main():
         try:
             # Generate
             image = generate_maze_image(
-                width=args.width, 
-                height=args.height, 
-                shape_idx=shape, 
-                style_idx=style, 
-                inner_width=args.inner_width,
-                inner_height=args.inner_height,
+                shape=shape,
+                style=style,
+                params=params,
                 starts_at=starts_at,
                 e_val=e_val, 
                 r_val=r_val
             )
             
             # Process
-            pgm_img, resolution = process_maze_image(image, args.robot_size, args.width)
+            pgm_img, resolution = process_maze_image(image, args.robot_size, maze_size_for_resolution)
             
-            # Save
+            # Save (including original PNG)
             suffix = f"_{i}" if args.count > 1 else ""
-            save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}")
+            save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}", original_image=image)
             
         except Exception as e:
             print(f"Failed to generate maze {i+1}: {e}")
-            # Continue to next maze if one fails?
-            # sys.exit(1) 
+            import traceback
+            traceback.print_exc()
             pass
 
 if __name__ == "__main__":
