@@ -286,6 +286,9 @@ def generate_maze_image(shape=1, style=1, params=None, starts_at=1, e_val=50, r_
             "AlgorithmParameter2TextBox": str(r_val),
         }
         
+        # Add a small delay to avoid rate limiting
+        time.sleep(0.5)
+        
         r_shape = s.post(url, data=shape_change_data)
         
         # Extract the new form fields after shape change
@@ -293,6 +296,9 @@ def generate_maze_image(shape=1, style=1, params=None, starts_at=1, e_val=50, r_
         
         if not viewstate or not eventvalidation:
             raise Exception("Failed to parse form fields after shape change")
+        
+        # Add another small delay
+        time.sleep(0.5)
     
     # Build form data based on shape
     data = build_form_data(
@@ -321,14 +327,25 @@ def generate_maze_image(shape=1, style=1, params=None, starts_at=1, e_val=50, r_
     print(f"Generating maze ({shape_name}, {style_name}, {size_desc})...")
     r_post = s.post(url, data=data)
     
-    # Find image URL
+    # Find image URL - try multiple patterns
     # Look for ImageGenerator.ashx
     match = re.search(r'src="(ImageGenerator\.ashx[^"]+)"', r_post.text)
     
     if not match:
-        # Try to find any image that looks like a maze if the ID changed
-        # Or maybe the response is different
-        raise Exception("Could not find maze image URL in response")
+        # Try alternate pattern with single quotes
+        match = re.search(r"src='(ImageGenerator\.ashx[^']+)'", r_post.text)
+    
+    if not match:
+        # Check if there's an error message in the response
+        error_match = re.search(r'<span[^>]*class="[^"]*error[^"]*"[^>]*>([^<]+)</span>', r_post.text, re.IGNORECASE)
+        if error_match:
+            raise Exception(f"Website returned error: {error_match.group(1)}")
+        
+        # Save debug info
+        debug_file = f"/tmp/maze_debug_{shape}_{style}.html"
+        with open(debug_file, 'w') as f:
+            f.write(r_post.text)
+        raise Exception(f"Could not find maze image URL in response. Debug saved to {debug_file}")
         
     img_rel_url = match.group(1).replace("&amp;", "&")
     img_url = url + img_rel_url
@@ -438,16 +455,18 @@ def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
     # Save PGM
     pgm_image.save(pgm_path)
     
-    # Create YAML
-    # Origin: [x, y, yaw]
-    # Usually bottom-left.
-    # We'll set origin so the map is centered or starts at (0,0).
-    # Let's start at (0,0).
+    # Calculate origin to center the maze
+    # Origin is the real-world position of the bottom-left pixel
+    # To center the maze, origin should be negative half of the map dimensions
+    map_width_m = pgm_image.width * resolution
+    map_height_m = pgm_image.height * resolution
+    origin_x = -map_width_m / 2.0
+    origin_y = -map_height_m / 2.0
     
     map_data = {
         'image': f"{base_name}.pgm",
         'resolution': float(resolution),
-        'origin': [0.0, 0.0, 0.0],
+        'origin': [origin_x, origin_y, 0.0],
         'negate': 0,
         'occupied_thresh': 0.65,
         'free_thresh': 0.196
@@ -461,6 +480,7 @@ def save_map(pgm_image, resolution, output_dir, base_name, original_image=None):
         print(f"  {png_path}")
     print(f"  {pgm_path}")
     print(f"  {yaml_path}")
+    print(f"  Map size: {map_width_m:.2f}m x {map_height_m:.2f}m, origin at center")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -603,29 +623,37 @@ Examples:
         e_val = args.e if args.e is not None else random.randint(0, 100)
         r_val = args.r if args.r is not None else random.randint(0, 100)
         
-        try:
-            # Generate
-            image = generate_maze_image(
-                shape=shape,
-                style=style,
-                params=params,
-                starts_at=starts_at,
-                e_val=e_val, 
-                r_val=r_val
-            )
-            
-            # Process
-            pgm_img, resolution = process_maze_image(image, args.robot_size, maze_size_for_resolution)
-            
-            # Save (including original PNG)
-            suffix = f"_{i}" if args.count > 1 else ""
-            save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}", original_image=image)
-            
-        except Exception as e:
-            print(f"Failed to generate maze {i+1}: {e}")
-            import traceback
-            traceback.print_exc()
-            pass
+        # Retry logic for maze generation
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Generate
+                image = generate_maze_image(
+                    shape=shape,
+                    style=style,
+                    params=params,
+                    starts_at=starts_at,
+                    e_val=e_val, 
+                    r_val=r_val
+                )
+                
+                # Process
+                pgm_img, resolution = process_maze_image(image, args.robot_size, maze_size_for_resolution)
+                
+                # Save (including original PNG)
+                suffix = f"_{i}" if args.count > 1 else ""
+                save_map(pgm_img, resolution, args.output_dir, f"{args.name}{suffix}", original_image=image)
+                
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"Attempt {attempt + 1} failed: {e}. Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    print(f"Failed to generate maze {i+1} after {max_retries} attempts: {e}")
+                    import traceback
+                    traceback.print_exc()
 
 if __name__ == "__main__":
     main()
