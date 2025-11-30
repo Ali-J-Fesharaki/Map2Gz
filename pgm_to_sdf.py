@@ -24,6 +24,13 @@ except ImportError:
     SKIMAGE_AVAILABLE = False
     print("Warning: scikit-image not available, advanced filtering disabled")
 
+# Optional import for FreeCAD conversion
+try:
+    from pgm_to_freecad import pgm_to_freecad_3d, generate_freecad_script_standalone
+    FREECAD_MODULE_AVAILABLE = True
+except ImportError:
+    FREECAD_MODULE_AVAILABLE = False
+
 
 def load_map_data(pgm_file, yaml_file):
     """Load PGM image and YAML metadata"""
@@ -1099,9 +1106,7 @@ def simple_pgm_to_sdf(pgm_file, yaml_file, output_sdf, wall_height=2.0, wall_thi
     
     # Handle FreeCAD method separately
     if method == 'freecad':
-        try:
-            from pgm_to_freecad import pgm_to_freecad_3d, generate_freecad_script_standalone
-        except ImportError:
+        if not FREECAD_MODULE_AVAILABLE:
             raise ImportError("pgm_to_freecad module not found. Ensure pgm_to_freecad.py is in the same directory.")
         
         output_dir = os.path.dirname(output_sdf) or '.'
